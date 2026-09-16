@@ -1,0 +1,168 @@
+/**
+ * Shared summon-attempt flow.
+ *
+ * Every summon entry point (the McLaunchPanel Launch button, crash-modal
+ * re-summons, the LAN modal retry) must run the same gates in the same order:
+ * the username-conflict guard, then the LAN gate — if connected, summon
+ * immediately; otherwise stash the pending id and open the Minecraft setup
+ * window on its "Connecting to world" tab in searching mode, which
+ * auto-resumes the summon when LAN flips to connected (McSetupModal, D-56).
+ *
+ * Centralised here (rather than duplicated per screen) so the gate order
+ * lives in one place. The old first-summon skin-setup nudge moved to the
+ * first OPEN of the Minecraft surface (maybeOfferSkinSetup in gameLaunch.ts,
+ * 260725) — by the time a summon fires the user has already been offered
+ * setup.
+ */
+
+import { sei } from './ipcClient';
+import { effectiveMcUsername } from '@shared/characterSchema';
+import { lanHostWarning, type LanHost, type LanHostWarning } from '@shared/ipc';
+import { useUiStore } from './stores/useUiStore';
+import { useDataStore } from './stores/useDataStore';
+import { useMcDashboardStore } from './stores/useMcDashboardStore';
+
+/**
+ * 260709 — pre-summon host-compatibility disclaimer bookkeeping. Session-scoped
+ * on purpose: the disclaimer is a heads-up, not a gate, so once the user has
+ * seen (and summoned past) it for a given warning kind we stay quiet until the
+ * next app launch. Not persisted — a modded world is worth one reminder per
+ * session, zero per click.
+ */
+const acknowledgedHostWarnings = new Set<LanHostWarning>();
+
+/** Called by the disclaimer's "Summon anyway" so this session stops asking. */
+export function acknowledgeHostWarning(kind: LanHostWarning): void {
+  acknowledgedHostWarnings.add(kind);
+}
+
+/**
+ * The summon itself + post-summon navigation. Shared by the direct path and
+ * the disclaimer modal's "Summon anyway" resume.
+ */
+export function launchSummon(id: string, fromChat: boolean): void {
+  // 260725: the dashboard's runtime controls (pause + reactive/proactive) are
+  // per-summon state. Drop any leftovers from a previous session here — the
+  // fresh bot process always starts unpaused and proactive, and a stale
+  // renderer "paused" flag would misreport it.
+  useMcDashboardStore.getState().reset(id);
+  void sei.summon(id).catch(() => {
+    // Errors surface via onStatus → BotStatus.error; the model row owns display.
+  });
+  useUiStore.getState().navigate(fromChat ? { kind: 'chat', characterId: id } : { kind: 'character', id });
+}
+
+/**
+ * Summon behind the host-compatibility disclaimer. If the detected host
+ * warrants a warning the user has not yet acknowledged this session, open the
+ * disclaimer modal (which resumes via launchSummon on "Summon anyway");
+ * otherwise summon straight away. Used by both the direct summon path
+ * (proceedSummon) and the McSetupModal auto-resume, so neither can skip the gate.
+ *
+ * 260721: the vanilla and modded warnings carry a persisted "Don't show this
+ * again" (config.hide_vanilla_host_warning / hide_modded_host_warning); a
+ * suppressed warning summons straight away. The config read is best-effort:
+ * if it fails we fall back to showing the warning (it never blocks anything,
+ * so over-showing is the safe failure).
+ */
+export async function summonWithHostGate(
+  id: string,
+  fromChat: boolean,
+  host: LanHost | undefined,
+): Promise<void> {
+  const warning = lanHostWarning(host);
+  if (warning && host && !acknowledgedHostWarnings.has(warning)) {
+    let suppressed = false;
+    if (warning === 'vanilla' || warning === 'modded') {
+      const cfg = await sei.getConfig().catch(() => null);
+      suppressed =
+        warning === 'vanilla'
+          ? cfg?.hide_vanilla_host_warning === true
+          : cfg?.hide_modded_host_warning === true;
+    }
+    if (!suppressed) {
+      useUiStore.getState().openModal({ kind: 'lan-host-warning', characterId: id, warning, host, fromChat });
+      return;
+    }
+  }
+  launchSummon(id, fromChat);
+}
+
+/**
+ * Multi-summon guard. Two bots cannot share an in-game username — the world
+ * kicks the second with `multiplayer.disconnect.name_taken`. If a
+ * currently-summoned (online or connecting) character already uses the target's
+ * effective MC username, open the conflict popup and return true (refuse). The
+ * supervisor has an authoritative backstop for the click-twice race; this is
+ * the user-facing surface on the common path. Case-insensitive to match MC.
+ */
+function blockedByUsernameConflict(id: string): boolean {
+  const { characters, summons } = useDataStore.getState();
+  const target = characters.find((c) => c.id === id);
+  if (!target) return false;
+  const targetName = effectiveMcUsername(target).toLowerCase();
+  const conflict = characters.find((c) => {
+    if (c.id === id) return false;
+    const st = summons[c.id]?.kind;
+    if (st !== 'online' && st !== 'connecting') return false;
+    return effectiveMcUsername(c).toLowerCase() === targetName;
+  });
+  if (!conflict) return false;
+  useUiStore.getState().openModal({
+    kind: 'summon-conflict',
+    attemptedName: target.name,
+    conflictName: conflict.name,
+    username: effectiveMcUsername(target),
+  });
+  return true;
+}
+
+/**
+ * Run the LAN gate and summon. Always navigates to the character page on the
+ * connected path — harmless when the caller is already on that page
+ * (CharacterPage) and matches the CharactersScreen card behavior.
+ */
+async function proceedSummon(id: string): Promise<void> {
+  const ui = useUiStore.getState();
+  // 260703: gate on a FRESH LAN read, not the store snapshot. The background
+  // poll damps open→closed transitions (OPEN_MISS_TOLERANCE), so a world that
+  // actually closed can keep reporting 'open' in the store for up to ~4s — long
+  // enough that a summon click would fire sei.summon(id) into a dead port and
+  // surface a connection error instead of the "open your world" setup window.
+  // The fresh check reads live ground truth; fall back to the store snapshot if
+  // the IPC fails. (A false 'closed' here self-heals: McSetupModal auto-resumes
+  // the pending summon when the next poll flips back to open.) checkNow also
+  // refreshes main's cached LAN state, so the port the actual summon reads is
+  // fresh too.
+  const lan = await sei.lanCheckNow().catch(() => useDataStore.getState().lan);
+  // Task 6 — if this summon was launched from THIS character's chat (the games
+  // popup opens over the chat view), keep the user in that chat once the bot
+  // joins rather than yanking them to the profile page. The floating widget +
+  // summon toast still surface the live session from anywhere.
+  const view = ui.view;
+  const fromChat = view.kind === 'chat' && view.characterId === id;
+  if (lan.kind === 'open') {
+    // 260709 — compatibility disclaimer: a vanilla (no skin mod), modded, or
+    // Lunar host gets a one-time heads-up before the first summon of the
+    // session. The modal's "Summon anyway" acknowledges and resumes via
+    // launchSummon; Cancel simply drops the attempt.
+    await summonWithHostGate(id, fromChat, lan.host);
+    return;
+  }
+  ui.setPendingSummon(id);
+  // Remember the origin so the McSetupModal auto-resume lands back in chat too.
+  ui.setPendingSummonReturnToChat(fromChat);
+  // Launch-blocked path: the Minecraft setup window, "Connecting to world"
+  // tab, WITH the searching animation (the only path that shows it).
+  ui.openModal({ kind: 'mc-setup', tab: 'world', searching: true });
+}
+
+/**
+ * Entry point for a summon attempt: the username-conflict guard, then the LAN
+ * gate ({@link proceedSummon}).
+ */
+export async function attemptSummon(id: string): Promise<void> {
+  // Refuse + popup if this character's in-game name collides with a live one.
+  if (blockedByUsernameConflict(id)) return;
+  await proceedSummon(id);
+}

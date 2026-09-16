@@ -1,0 +1,11 @@
+/* HardStopModal (PROXY-06) — Party redesign.
+   The scrim, panel, title, footer + animations are owned by ModalShell now;
+   only the body copy style remains here. */
+
+.body {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text-2);
+  margin: 0;
+}

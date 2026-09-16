@@ -1,0 +1,155 @@
+/* fonts.css — self-hosted @font-face declarations (D-05 — no CDN).
+ * Files live in src/renderer/public/fonts/, served at /fonts/<file>.woff2 by Vite.
+ *
+ * Type system (see .planning/UI-DESIGN-SYSTEM.md §Typography):
+ *   Oswald          — condensed display headers (--display)
+ *   Rajdhani        — UI body / sans (--sans)
+ *   JetBrains Mono  — tracked uppercase labels + numerics (--mono)
+ *   Press Start 2P  — procedural pixel-portrait fallback only (--pixel)
+ *   Noto Sans       — legibility fallback inside --sans / --display stacks
+ */
+
+/* ── Oswald (variable woff2 — one file slices weights via font-weight) ── */
+@font-face {
+  font-family: 'Oswald';
+  src: url('/fonts/oswald-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Oswald';
+  src: url('/fonts/oswald-600.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Oswald';
+  src: url('/fonts/oswald-700.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Rajdhani (UI body) ───────────────────────────────────────────── */
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('/fonts/rajdhani-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('/fonts/rajdhani-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('/fonts/rajdhani-600.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('/fonts/rajdhani-700.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Noto Sans (legibility fallback) ──────────────────────────────── */
+@font-face {
+  font-family: 'Noto Sans';
+  src: url('/fonts/noto-sans-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Noto Sans';
+  src: url('/fonts/noto-sans-600.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Press Start 2P (pixel-portrait fallback) ─────────────────────── */
+@font-face {
+  font-family: 'Press Start 2P';
+  src: url('/fonts/press-start-2p-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── JetBrains Mono (labels + numerics) ───────────────────────────── */
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/jetbrains-mono-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/jetbrains-mono-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/jetbrains-mono-700.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Architects Daughter (Draw! minigame only, OFL-1.1) ───────────────
+ * The Draw! surface deliberately sits outside the Summoning Terminal type
+ * system: it is a white page in a handdrawn register, so it uses this face
+ * rather than --display/--sans. Nothing else in the app should reference it.
+ */
+@font-face {
+  font-family: 'Architects Daughter';
+  src: url('/fonts/architects-daughter-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Roboto Mono (Draw! minigame only, Apache-2.0) ────────────────────
+ * The typed half of the Draw! surface: the round counter, the clock, the
+ * tagline. It pairs with Architects Daughter the way a printed form pairs
+ * with what someone wrote on it, and it is the one place in the app that
+ * does NOT use JetBrains Mono for its monospace. Nothing else should
+ * reference it.
+ */
+@font-face {
+  font-family: 'Roboto Mono';
+  src: url('/fonts/roboto-mono-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Roboto Mono';
+  src: url('/fonts/roboto-mono-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}

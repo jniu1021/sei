@@ -1,0 +1,508 @@
+// src/adapter/minecraft/connect.js
+//
+// Mineflayer bot lifecycle: createBot + plugin loading + reconnect loop +
+// reason humanizer. Extracted from the old src/bot.js. This module is the
+// only place that imports from `mineflayer` directly. Brain code never sees
+// a mineflayer Bot instance — it talks to the Adapter built around it.
+
+import { createBot } from 'mineflayer'
+import minecraftProtocol from 'minecraft-protocol'
+import minecraftData from 'minecraft-data'
+import { pathfinder } from 'mineflayer-pathfinder'
+
+// minecraft-protocol / minecraft-data are CJS (and arrive transitively via
+// mineflayer, exactly as the test suite already consumes minecraft-data). Pull
+// the version-resolution surface off the default export to stay ESM-safe.
+const { ping, supportedVersions } = minecraftProtocol
+import { startFollow, stopFollow } from './behaviors/follow.js'
+import { startPosHealer, stopPosHealer } from './observers/posHealer.js'
+import { startChat } from './behaviors/chat.js'
+import { startAutoEat } from './behaviors/autoEat.js'
+import { startCombat } from './behaviors/combat.js'
+import { startReflex } from './behaviors/reflex.js'
+import { startGaze } from './behaviors/gaze.js'
+import { startSurvival } from './behaviors/survival.js'
+import { applyWorldPause } from './behaviors/pause.js'
+import { installFaceOnDig } from './behaviors/face.js'
+import { forgeHandshakeEnabled, installForgeHandshake, sampleWorldNames } from './forgeHandshake.js'
+
+/**
+ * Extract human-readable text from mineflayer kick/disconnect reasons,
+ * which are often chat-component objects ({text, translate, extra:[...]})
+ * rather than plain strings. String(obj) yields '[object Object]' which
+ * is useless to the user.
+ */
+function extractReasonText(reason) {
+  if (reason == null) return ''
+  if (typeof reason === 'string') return reason
+  if (typeof reason === 'object') {
+    if (typeof reason.text === 'string' && reason.text.length) return reason.text
+    if (typeof reason.translate === 'string' && reason.translate.length) return reason.translate
+    if (Array.isArray(reason.extra)) {
+      const joined = reason.extra.map(e => (e && typeof e.text === 'string') ? e.text : '').join('')
+      if (joined.length) return joined
+    }
+    try { return JSON.stringify(reason) } catch (_) { return String(reason) }
+  }
+  return String(reason)
+}
+
+/**
+ * Did the world reject us for being a vanilla client on a modded server?
+ *
+ * mineflayer speaks vanilla protocol and answers "not understood" to every
+ * login plugin request (node-minecraft-protocol src/client/pluginChannels.js
+ * onLoginPluginRequest), exactly like a Notchian client. A Forge/NeoForge server
+ * whose mods require a matching client sees that and kicks us. This is a
+ * PERMANENT property of the world: retrying cannot fix it, so the caller must
+ * fail fast rather than burn the reconnect budget (260806 — a NeoForge 1.20.1
+ * world cost one user five summon attempts, each retried 3x, all reported as
+ * "we can't see an open LAN world" while the world was open the whole time).
+ *
+ * Wordings this has to cover, all seen in the wild:
+ *   Forge     "Incompatible FML modded server" / "Please install Forge to connect"
+ *   NeoForge  "This server has mods that require NeoForge to be installed on the client."
+ *   Fabric    "This server requires the following mods..." (registry sync)
+ *
+ * The `mods` + `require|install` pair is what catches the NeoForge wording, which
+ * names none of the loaders as a bare word. It is deliberately a PAIR: "mods"
+ * alone appears in plenty of benign kick text ("Server is running with 3 mods
+ * loaded"), and a bare /mod/ would match "model".
+ *
+ * This is a strict SUPERSET of the 260709 check it replaced — that one was
+ * `fml || (fabric && (mod || require))`, and the fabric clause is kept below
+ * verbatim so a "requires Fabric" kick that never says "mods" still lands.
+ *
+ * @param {unknown} reason  raw or already-extracted disconnect reason
+ * @returns {boolean}
+ */
+export function isModdedHostRejection(reason) {
+  if (!reason) return false
+  const r = extractReasonText(reason).toLowerCase()
+  // Loader named outright. `quilt` joins forge/neoforge because shared/ipc.ts
+  // already classifies it alongside them as a modded host.
+  if (/\bfml\b|neoforge|\bforge\b|\bquilt\b/.test(r)) return true
+  // 260709's fabric clause, unchanged.
+  if (r.includes('fabric') && (r.includes('mod') || r.includes('require'))) return true
+  // Loader unnamed: "...has mods that require ... to be installed on the client".
+  if (/\bmods?\b/.test(r) && /\brequires?\b|\binstall(ed)?\b/.test(r)) return true
+  return false
+}
+
+/**
+ * Plain-English translation of mineflayer disconnect reasons. Exposed for
+ * the boot composer's status surface.
+ */
+export function humanizeReason(reason) {
+  if (!reason) return 'Unknown reason'
+  const text = extractReasonText(reason)
+  const r = text.toLowerCase()
+  // Modded-server rejections FIRST (260709): the wordings can contain 'connect'
+  // ("Please install Forge to connect"), so this must precede that check.
+  if (isModdedHostRejection(text)) {
+    return 'This world runs Forge or NeoForge and only lets in players who have its mods. Sei joins as a vanilla client, so the world turns it away'
+  }
+  // Chat-signing rejection (260710): the server refused one of OUR chat
+  // packets (seen live as multiplayer.disconnect.chat_validation_failed on
+  // 1.21.11 — an nmp chat-checksum bug, fixed by the 1.66.2 bump). Name it
+  // rather than letting the generic branches mangle it.
+  if (r.includes('chat_validation_failed') || r.includes('out_of_order_chat')) {
+    return 'Kicked over a chat protocol hiccup. Rejoining usually works'
+  }
+  // NOTE: every vanilla kick key starts with "multiplayer.disconnect.", which
+  // CONTAINS "connect" — the bare substring check used to mislabel all kicks
+  // as "Could not reach server" (260710 chat_validation_failed report). Strip
+  // that prefix before the connectivity match so only real reachability text
+  // ("connect ETIMEDOUT", "Connection refused") lands here.
+  const rNoKickPrefix = r.replace(/multiplayer\.disconnect\.?/g, '')
+  if (r.includes('econnrefused') || rNoKickPrefix.includes('connect')) return 'Could not reach server. Make sure a LAN world is open'
+  if (r.includes('timeout')) return 'Connection timed out. The server may be unreachable'
+  if (r.includes('kicked')) return `Kicked: ${text}`
+  if (r.includes('invalid session') || r.includes('auth')) return 'Authentication failed. Check auth mode'
+  return text || 'Unknown reason'
+}
+
+/**
+ * 260508-nkk: wall-clock budget for the bot's mineflayer spawn handshake.
+ * Mandated by CLAUDE.md "every external call has a timeout". mineflayer has
+ * no internal connect deadline — without this, a wrong-host / unreachable
+ * LAN / stalled auth hangs silently inside its TCP retry loop.
+ *
+ * 260801: this is now the CEILING, not the budget. The original comment here
+ * claimed 20s "is below the supervisor's 30s outer SUMMON_TIMEOUT_MS so the
+ * bot's structured BOT_START_TIMEOUT reaches main with ~10s margin", which was
+ * wrong: this timer starts at createBot and the supervisor's starts at fork,
+ * so the true margin is 10s minus boot minus the status ping (up to 5s). The
+ * actual budget comes from connectTimeoutFor() below.
+ */
+const CONNECT_TIMEOUT_MS = 20_000
+
+/**
+ * 260801: slack left between this guard firing and the supervisor's watchdog,
+ * for the lifecycle message to cross the MessagePort and be captured.
+ */
+const REPORT_MARGIN_MS = 3_000
+
+/**
+ * Floor for the connect guard. If boot was so slow that almost none of the
+ * summon budget is left, a deadline-derived timeout would be ~0 and would kill
+ * a perfectly healthy handshake on arrival. Better to run the floor and lose
+ * the race to the supervisor than to invent a failure.
+ */
+const MIN_CONNECT_TIMEOUT_MS = 5_000
+
+/**
+ * How long to give mineflayer's spawn handshake THIS attempt.
+ *
+ * The flat CONNECT_TIMEOUT_MS is armed at createBot, while the supervisor's
+ * 30s watchdog is armed at fork, so the child only reports first if boot plus
+ * the status ping fit in the 10s difference. On a cold packaged Windows start
+ * they do not, and the specific error is lost: on 260801 a user whose world
+ * was open and answering pings got the generic "make sure your LAN world is
+ * still open" instead of "reached the server, never finished joining".
+ *
+ * Given the supervisor's deadline we can size the guard to land just inside
+ * it regardless of how long boot took, which is what makes a stall
+ * diagnosable. With no deadline (older main) this is the old constant.
+ */
+function connectTimeoutFor(summonDeadlineAt, now = Date.now()) {
+  if (!Number.isFinite(summonDeadlineAt)) return CONNECT_TIMEOUT_MS
+  const remaining = summonDeadlineAt - now - REPORT_MARGIN_MS
+  return Math.max(MIN_CONNECT_TIMEOUT_MS, Math.min(CONNECT_TIMEOUT_MS, remaining))
+}
+
+export const __testables = { connectTimeoutFor, CONNECT_TIMEOUT_MS, REPORT_MARGIN_MS, MIN_CONNECT_TIMEOUT_MS }
+
+// Wall-clock budget for the pre-connect status ping (resolveServerVersion).
+// Short — a LAN status query on localhost answers in well under a second; if it
+// stalls we fall back to mineflayer's own auto-detect rather than block summon.
+const PING_TIMEOUT_MS = 5_000
+
+/**
+ * Map a wire protocol number to a version string our networking layer actually
+ * implements (minecraft-protocol.supportedVersions). Returns null when none of
+ * the supported versions speak that protocol.
+ */
+function supportedVersionForProtocol(protocol) {
+  if (typeof protocol !== 'number') return null
+  for (const v of supportedVersions) {
+    let data
+    try { data = minecraftData(v) } catch { continue }
+    if (data && data.version && data.version.version === protocol) return v
+  }
+  return null
+}
+
+/**
+ * Pick the supported version string for a pinged server. Prefer the server's
+ * self-reported name when we support it verbatim (disambiguates versions that
+ * share a protocol number, e.g. 1.20 vs 1.20.1); else fall back to the protocol
+ * match. Returns null when the server's version is outside our supported set.
+ */
+function resolveSupportedVersion(name, protocol) {
+  if (typeof name === 'string' && supportedVersions.includes(name)) return name
+  return supportedVersionForProtocol(protocol)
+}
+
+function pingWithTimeout(options, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      const e = new Error(
+        `LAN_PING_TIMEOUT: no status response from ${options.host}:${options.port} within ${timeoutMs}ms`,
+      )
+      e.code = 'LAN_PING_TIMEOUT'
+      reject(e)
+    }, timeoutMs)
+    try {
+      ping(options, (err, result) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (err) {
+          if (!err.code) err.code = 'LAN_PING_FAILED'
+          reject(err)
+        } else {
+          resolve(result)
+        }
+      })
+    } catch (e) {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(e)
+    }
+  })
+}
+
+/**
+ * Status-ping the LAN server and resolve the Minecraft version Sei should
+ * connect with, bounded to what our networking deps actually implement. The
+ * Electron path passes `version: 'auto'`; this resolves it to an EXPLICIT
+ * supported version which is then handed to createBotInstance — deliberately
+ * sidestepping mineflayer's in-handshake auto-detect, which historically
+ * produced protocol kicks against modern LAN worlds.
+ *
+ * @returns {Promise<string>} a supported version string (e.g. '1.20.6').
+ * @throws  Error with `.code`:
+ *   - 'UNSUPPORTED_MC_VERSION' — the server runs a version outside
+ *     minecraft-protocol.supportedVersions. The caller surfaces a clean error
+ *     and must NOT attempt to connect (it would only earn a protocol kick).
+ *   - 'LAN_PING_TIMEOUT' / 'LAN_PING_FAILED' — the ping itself failed. The
+ *     caller may fall back to mineflayer's auto-detect; a genuinely unreachable
+ *     world is then handled by the normal connect / reconnect path.
+ */
+export async function resolveServerVersion({ host, port, timeoutMs = PING_TIMEOUT_MS, logger = console }) {
+  const status = await pingWithTimeout({ host, port }, timeoutMs)
+  const name = status && status.version && status.version.name
+  const protocol = status && status.version && status.version.protocol
+  const resolved = resolveSupportedVersion(name, protocol)
+  if (!resolved) {
+    const reported = name || (typeof protocol === 'number' ? `protocol ${protocol}` : 'an unknown version')
+    const err = new Error(
+      `UNSUPPORTED_MC_VERSION: This world is running Minecraft ${reported}, which Sei can't join yet. ` +
+      `Sei supports Java ${supportedVersions[0]}–${supportedVersions[supportedVersions.length - 1]}. ` +
+      `Switch your world to a supported version and click Summon again.`,
+    )
+    err.code = 'UNSUPPORTED_MC_VERSION'
+    throw err
+  }
+  logger.info?.(
+    `[sei] Server ping: version "${name ?? '?'}" (protocol ${protocol ?? '?'}) → connecting as ${resolved}`,
+  )
+  return resolved
+}
+
+/**
+ * Construct a mineflayer Bot, wire up the always-on adapter behaviors
+ * (pathfinder plugin, posHealer, autoEat, combat, follow, chat) on first
+ * spawn, and hand it back. The reconnect loop is owned here too — on `end`,
+ * the boot composer's onEnd hook fires and a fresh createBotInstance call
+ * is scheduled.
+ *
+ * @param {Object} opts
+ * @param {string} opts.host
+ * @param {number} [opts.port]
+ * @param {'offline'|'microsoft'} opts.auth
+ * @param {string} opts.username
+ * @param {string} [opts.version]                  — pass undefined to let mineflayer auto-detect
+ * @param {object} opts.config                     — full validated config (passed through to behaviors)
+ * @param {{info?:Function,warn?:Function,error?:Function}} [opts.logger]
+ * @param {() => void} [opts.onSpawn]              Called once on first spawn (after plugins load).
+ * @param {(reason:string) => void} [opts.onEnd]   Called when the connection drops; humanized reason.
+ * @param {(err:Error) => void} [opts.onError]     Called on connection-level errors.
+ * @param {(err:Error) => void} [opts.onConnectTimeout]
+ *   260508-nkk: invoked when the connect budget (connectTimeoutFor) elapses without the bot
+ *   firing its first 'spawn' event — i.e. mineflayer is silently stalled
+ *   in handshake / TCP retry / Microsoft auth. The bot is also force-quit
+ *   so it doesn't keep retrying in the background.
+ * @returns {object} mineflayer Bot instance (always-on behaviors already started on spawn).
+ */
+export function createBotInstance({
+  host, port, auth, username, version,
+  config,
+  logger = console,
+  onSpawn,
+  onEnd,
+  onError,
+  onConnectTimeout,
+}) {
+  const botOpts = { host, port, username, auth }
+  // mineflayer auto-detects when version is omitted/undefined.
+  if (version && version !== 'auto') botOpts.version = version
+
+  const bot = createBot(botOpts)
+
+  // Forge/NeoForge handshake SPIKE (260806). Off unless SEI_FORGE_HANDSHAKE=1.
+  // Must be installed here, immediately after createBot and before the socket
+  // reaches the login state: it sets `client.tagHost`, which nmp reads inside
+  // its own 'connect' handler. Never allowed to break a normal summon, hence
+  // the catch — this is unproven code behind a flag, and a throw here would
+  // take out a join that would otherwise have worked.
+  if (forgeHandshakeEnabled()) {
+    try {
+      installForgeHandshake(bot, { logger })
+    } catch (err) {
+      logger.warn?.(`[sei/forge] handshake spike failed to install: ${err && err.message}`)
+    }
+  }
+
+  let _spawned = false
+  // 260508-nkk: wall-clock guard. Cleared on first 'spawn' or on 'end' /
+  // 'error' / 'kicked' (those routes already surface a humanized reason
+  // to the boot composer's onEnd/onError, so the timeout would be
+  // redundant noise). If it fires, force-quit the bot and notify the
+  // boot composer through onConnectTimeout so the lifecycle layer can
+  // emit BOT_START_TIMEOUT.
+  // 260801: sized against the supervisor's deadline (see connectTimeoutFor) so
+  // this specific error beats the generic 30s watchdog even on a slow boot.
+  const _connectBudgetMs = connectTimeoutFor(config?._seiSummonDeadlineAt)
+  const _bootMs = Math.round(process.uptime() * 1000)
+  logger.info?.(
+    `[sei] connect guard: ${_connectBudgetMs}ms (boot took ~${_bootMs}ms before this attempt)`,
+  )
+  let _connectTimer = setTimeout(() => {
+    if (_spawned) return
+    _connectTimer = null
+    // Only claim the world was reachable when we actually proved it. A
+    // resolved version means resolveServerVersion's status ping ANSWERED;
+    // 'auto' means it failed and we fell back to in-handshake detection, where
+    // an unreachable host is still on the table.
+    const _pinged = version && version !== 'auto'
+    const err = new Error(
+      `BOT_START_TIMEOUT: mineflayer.spawn did not fire within ${_connectBudgetMs / 1000}s of ` +
+      `createBot (process boot took ~${_bootMs}ms first). ` +
+      (_pinged
+        ? `The server at ${host}:${port} answered a status ping and resolved to ${version}, so ` +
+          `the world is open and reachable; the JOIN stalled (login/configuration handshake ` +
+          `never reached 'spawn'). NOT a closed LAN world.`
+        : `The status ping did not resolve a version, so the world may be unreachable at ` +
+          `${host}:${port}, or the join stalled in handshake.`),
+    )
+    logger.error?.(`[sei] ${err.message}`)
+    // Stop mineflayer from retrying so the utilityProcess can shut down
+    // cleanly after the supervisor receives the lifecycle error.
+    try { bot.quit?.('connect timeout') } catch {}
+    try { bot.end?.() } catch {}
+    try { onConnectTimeout?.(err) } catch (cbErr) {
+      logger.warn?.(`[sei/connect] onConnectTimeout hook threw: ${cbErr && cbErr.message}`)
+    }
+  }, _connectBudgetMs)
+  const _clearConnectTimer = () => {
+    if (_connectTimer != null) {
+      clearTimeout(_connectTimer)
+      _connectTimer = null
+    }
+  }
+
+  // Isolate each spawn-setup step so ONE throwing behavior can never strand the
+  // summon. Reaching 'spawn' means the bot IS in the world, so onSpawn (which
+  // fires summon-ready) must run regardless — otherwise the connect timer is
+  // already cleared and the session hangs on "Connecting…" until the
+  // supervisor's 30s timeout. A failed behavior degrades that one feature only.
+  const safeStart = (label, fn) => {
+    try { fn() } catch (err) { logger.warn?.(`[sei/connect] ${label} failed on spawn: ${err && err.message}`) }
+  }
+
+  bot.on('spawn', () => {
+    logger.info?.(`[sei] Connected to ${host}:${port} as ${username}`)
+    if (!_spawned) {
+      _spawned = true
+      _clearConnectTimer()
+      safeStart('loadPlugin(pathfinder)', () => bot.loadPlugin(pathfinder))
+      // Face-what-you-break (260708): wrap bot.dig AFTER the pathfinder loads
+      // so its path-clearing digs (instant head-snap) get the visible turn too.
+      safeStart('installFaceOnDig', () => installFaceOnDig(bot))
+      safeStart('startPosHealer', () => startPosHealer(bot))
+      safeStart('startAutoEat', () => startAutoEat(bot))
+      safeStart('startCombat', () => startCombat(bot, config))
+      safeStart('startReflex', () => startReflex(bot, config))
+      safeStart('startSurvival', () => startSurvival(bot, config))
+      safeStart('startGaze', () => startGaze(bot, config))
+      safeStart('startFollow', () => startFollow(bot, config))
+      // 260725: a reconnect while the player has the game paused must come
+      // back frozen, not quietly resume trailing/evading on the fresh bot.
+      safeStart('applyWorldPause', () => applyWorldPause(bot))
+      // Forge spike measurement (260806): once the world has streamed in, report
+      // how much of it mineflayer could not name. See sampleWorldNames — this is
+      // the whole point of the spike, and it is read-only.
+      if (forgeHandshakeEnabled()) {
+        setTimeout(() => {
+          try { sampleWorldNames(bot, logger) } catch (err) {
+            logger.warn?.(`[sei/forge] world sample failed: ${err && err.message}`)
+          }
+        }, 5000).unref?.()
+      }
+      try { onSpawn?.() } catch (err) { logger.warn?.(`[sei/connect] onSpawn hook threw: ${err && err.message}`) }
+    } else {
+      // respawn after death — restart follow + re-arm the reflex/survival/gaze
+      // loops (their disposers tear down on death, so respawn must re-arm).
+      safeStart('startReflex(respawn)', () => startReflex(bot, config))
+      safeStart('startSurvival(respawn)', () => startSurvival(bot, config))
+      safeStart('startGaze(respawn)', () => startGaze(bot, config))
+      safeStart('startFollow(respawn)', () => startFollow(bot, config))
+      safeStart('applyWorldPause(respawn)', () => applyWorldPause(bot))
+    }
+  })
+
+  bot.on('death', () => {
+    logger.info?.('[sei] Sei died — respawning...')
+    // Snapshot the death position BEFORE bot.respawn() teleports the entity
+    // back to world spawn — that's where everything the bot was carrying
+    // dropped, so the brain needs it to tell the player where to recover their
+    // items. Guard against a partially-loaded entity (NaN coords) so a bad
+    // position degrades to null (no coords) rather than "~NaN,NaN,NaN".
+    let pos = null
+    try {
+      const p = bot.entity?.position
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z)) {
+        pos = { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) }
+      }
+    } catch { /* pos stays null */ }
+    // Emit once per death, up to the brain (fsmWires → handlers.onDeath). The
+    // respawn timer is unchanged; the priority queue serializes the death event
+    // and the respawn spawn, so they don't race.
+    try { bot.emit('sei:death', { pos }) } catch (err) { logger.warn?.(`[sei/connect] sei:death emit threw: ${err && err.message}`) }
+    setTimeout(() => bot.respawn(), 500)
+  })
+
+  bot.on('error', (err) => {
+    const reason = humanizeReason(err && (err.message || err))
+    logger.warn?.(`[sei] Connection error: ${reason}`)
+    // 260508-nkk: surfaced 'error' before spawn means the connection died
+    // for a reason mineflayer recognizes (ECONNREFUSED, kicked, etc.) —
+    // clear the timer so onConnectTimeout doesn't ALSO fire later.
+    if (!_spawned) _clearConnectTimer()
+    try { onError?.(err) } catch {}
+  })
+
+  // 260806: mineflayer emits 'kicked' with the server's reason and then 'end'
+  // with a bare 'socketClosed'. onEnd is where every terminal decision is made,
+  // so without holding onto the kick text the ONLY thing that says why we were
+  // ejected is gone by the time anyone can act on it — which is how a NeoForge
+  // rejection came out the other side as "we can't see an open LAN world".
+  let _lastKickReason = null
+
+  bot.on('kicked', (reason) => {
+    // Log RAW reason text BEFORE humanization. The 'connect' substring match
+    // in humanizeReason has previously masked protocol-handshake kicks (e.g.
+    // "Outdated client/server", "Failed to verify username") as the generic
+    // "Could not reach server" — burning multiple debug iterations chasing
+    // a TCP issue that wasn't there. Always emit the raw text so future-us
+    // can tell a real ECONNREFUSED apart from a server-sent kick packet.
+    _lastKickReason = reason
+    logger.warn?.(`[sei] Kicked (raw): ${extractReasonText(reason)}`)
+    logger.warn?.(`[sei] Kicked: ${humanizeReason(reason)}`)
+    if (!_spawned) _clearConnectTimer()
+  })
+
+  bot.on('end', (reason) => {
+    stopFollow()
+    stopPosHealer()
+    if (!_spawned) _clearConnectTimer()
+    const raw = extractReasonText(reason)
+    // A kick is always followed by 'end' carrying only the transport's view
+    // ('socketClosed'), which says nothing about WHY. Prefer the kick reason we
+    // just saw; keep the end reason when the socket died on its own (no kick).
+    const effective = _lastKickReason != null && /^socketclosed$/i.test(raw.trim())
+      ? _lastKickReason
+      : reason
+    const humanized = humanizeReason(effective)
+    logger.info?.(`[sei] Disconnected (raw): ${raw}`)
+    logger.info?.(`[sei] Disconnected: ${humanized}`)
+    // The second argument is the structured half: onEnd's caller decides whether
+    // to retry, and a modded-host rejection must NOT be retried (see
+    // isModdedHostRejection).
+    try { onEnd?.(humanized, { modded: isModdedHostRejection(effective) }) } catch {}
+  })
+
+  // Expose the chat starter so the brain (which knows the orchestrator) can
+  // pass it in after construction. startChat sets up the bot.on('chat')
+  // listener and the stop-verb fast path; it requires the orchestrator
+  // reference for the abort-on-player-chat behavior.
+  bot._sei_startChat = (orchestrator) => startChat(bot, config, orchestrator)
+
+  return bot
+}

@@ -1,0 +1,238 @@
+/* SettingsScreen.module.css — "Party" restyle.
+ * Centered 780px column, Oswald group headers (sentence case), label|value|control
+ * rows with hairline bottom borders. Seg + Toggle primitives own their own CSS.
+ * Source: .planning/design/UI-REDESIGN-PARTY.md §4.7; mockup .set-col / .set-row.
+ */
+
+/* Scroll body — fills the surface; the column centers within it. */
+.root {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-lg) 0 var(--space-2xl);
+}
+
+.col {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 0 var(--space-lg);
+  display: flex;
+  flex-direction: column;
+}
+
+.group {
+  padding: var(--space-xs) 0 var(--space-lg);
+}
+
+.groupTitle {
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--text-2);
+  margin: 0 0 var(--space-xs);
+}
+
+/* label | (value) | control */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-md) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Profile portrait + name field — same hairline rhythm, taller for the avatar. */
+.profileRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-md) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.profileName {
+  flex: 1;
+  min-width: 0;
+}
+
+.label {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  font-family: var(--sans);
+  font-size: 14px;
+  color: var(--text);
+}
+
+.value {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.monoValue {
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+/* Inline editor cluster (API key edit, name) — right-aligned, control sits last. */
+.editor {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.editor > :first-child {
+  flex: 1;
+  min-width: 0;
+  max-width: 360px;
+}
+
+/* Supplementary lines under a row (export path, switch notice, danger blurb).
+   No border — they belong to the row above. */
+.helper {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--muted);
+  margin: var(--space-xs) 0 0;
+}
+
+/* Inline text link inside a .helper line (e.g. the photo credits). */
+.creditLink {
+  -webkit-appearance: none;
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  color: var(--muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.creditLink:hover {
+  color: var(--accent);
+}
+
+.helperError {
+  color: var(--red);
+}
+
+.statusInline {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.errorRow {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--red);
+  padding: var(--space-xs) 0;
+}
+
+/* 260724: theme swatches — a circle split diagonally between each theme's two
+   main colors (fill set inline per theme). Round on purpose: these are color
+   chips, not controls in the sharp-edged chrome vocabulary. Names ride the
+   shared data-tip tooltip. */
+.swatchRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.swatch {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  /* The two color halves (inline gradient) fill the WHOLE circle — the border
+     is transparent so nothing behind the button leaks in at the rim; a faint
+     INSET hairline keeps light swatches visible on light surfaces. Selected
+     state paints the accent ring over the gradient's outer edge instead of
+     around it, so there is never a gap between ring and fill. */
+  border: 2px solid transparent;
+  box-shadow: inset 0 0 0 1px var(--border);
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+
+.swatch:hover {
+  transform: scale(1.12);
+}
+
+.swatchOn {
+  border-color: var(--accent);
+}
+
+/* 260724: Theme-section range sliders (background visibility / brightness).
+   Thin hairline track + square accent thumb, sharp per D-28. */
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 180px;
+  height: 2px;
+  background: var(--border-strong);
+  outline: none;
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+}
+
+.slider:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 4px;
+}
+
+/* Icon-only copy affordance for the Account ID row. Mirrors the chat message
+   hover actions; the "Copied" flash rides the global data-tip tooltip. */
+.copyBtn {
+  -webkit-appearance: none;
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 120ms var(--ease), background 120ms var(--ease);
+}
+.copyBtn:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.copyBtn:focus-visible {
+  outline: 1.5px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.idValue {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.idValue .monoValue {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
