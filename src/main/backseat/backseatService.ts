@@ -151,6 +151,9 @@ interface Session {
   prevGrid: { data: string; at: number } | null;
   /** Per-session log into the in-app console + a rolling file (backseatLog). */
   log: BackseatLog;
+  /** Local evaluation counts, reset with the session. */
+  awakeTurns: number;
+  modelCalls: number;
 }
 
 const sessions = new Map<string, Session>();
@@ -162,6 +165,7 @@ let deps: BackseatDeps | null = null;
  * artifacts). Overwrites in place — this is a peephole, not a recording.
  */
 async function dumpGridForDev(kind: string, grid: string): Promise<void> {
+  if (process.env.BACKSEAT_DEBUG_GRIDS !== '1') return;
   try {
     const { app } = await import('electron');
     if (app.isPackaged) return;
@@ -234,9 +238,11 @@ export async function startBackseat(
     historyAnchor: -1,
     prevGrid: null,
     log,
+    awakeTurns: 0,
+    modelCalls: 0,
   };
   sessions.set(characterId, s);
-  slog(s, `session start: mode=${mode}, source="${sourceName}"`);
+  slog(s, `session start: mode=${mode}, source_kind=${sourceId.startsWith('screen:') ? 'screen' : 'window'}`);
   // 260803: main no longer opens a window here. The renderer starts capture
   // itself right after this resolves (useBackseatStore.share), which is what
   // lets the share be a call control rather than a launch.
@@ -244,7 +250,7 @@ export async function startBackseat(
 
   void (async () => {
     const { app } = await import('electron');
-    if (!app.isPackaged) {
+    if (!app.isPackaged && process.env.BACKSEAT_DEBUG_GRIDS === '1') {
       slog(s, `dev grid dumps: ${path.join(app.getPath('userData'), 'backseat-debug')}`);
     }
   })().catch(() => {});
@@ -455,7 +461,7 @@ async function honorRemember(
     const text = String((b.input as { text?: string })?.text ?? '').trim();
     if (!text) continue;
     if (!fromUserTick && Date.now() - s.lastRememberAt < REMEMBER_COOLDOWN_MS) {
-      slog(s, `remember() throttled ("${text.slice(0, 60)}")`);
+      slog(s, 'remember() throttled');
       continue;
     }
     try {
@@ -499,6 +505,8 @@ export async function handleTick(tick: BackseatTick): Promise<void> {
     s.inflightKind = null;
   }
   slog(s, `tick ${label} -> turn`);
+  s.awakeTurns++;
+  slog(s, `[eval] awake_count=${s.awakeTurns} kind=${label}`);
   void dumpGridForDev(tick.kind, tick.grid);
 
   // The player's typed line is real conversation: persist it to the shared
@@ -648,21 +656,24 @@ async function runTurn(s: Session, tick: BackseatTick, ctrl: AbortController): P
   messages.push({ role: 'user', content: content as never });
 
   const { client, model } = await buildChatSdk();
-  const res = await client.messages.create(
-    {
-      model,
-      // Two short lines. A cap this low is itself a register control: it is
-      // hard to write a paragraph in 160 tokens. 260804: a tick the player
-      // SPOKE gets room for a real answer, because this is now the only turn
-      // they get — the director routes their utterance here rather than running
-      // a second, screenless one alongside it.
-      max_tokens: tick.kind === 'user' ? 400 : 160,
-      system,
-      tools: [SAVE_CLIP_TOOL, REMEMBER_TOOL],
-      messages: messages as never,
-    },
-    { timeout: CHAT_TIMEOUT_MS, signal: ctrl.signal },
-  );
+  const callStartedAt = Date.now();
+  s.modelCalls++;
+  slog(s, `[eval] model_call_count=${s.modelCalls} kind=${tick.kind}`);
+  let res: Awaited<ReturnType<typeof client.messages.create>>;
+  try {
+    res = await client.messages.create(
+      {
+        model,
+        max_tokens: tick.kind === 'user' ? 400 : 160,
+        system,
+        tools: [SAVE_CLIP_TOOL, REMEMBER_TOOL],
+        messages: messages as never,
+      },
+      { timeout: CHAT_TIMEOUT_MS, signal: ctrl.signal },
+    );
+  } finally {
+    slog(s, `[eval] model_latency_ms=${Date.now() - callStartedAt} kind=${tick.kind} aborted=${ctrl.signal.aborted}`);
+  }
   if (ctrl.signal.aborted || s.inflight !== ctrl) return;
 
   // The cache layout above is only worth anything if it hits, and the only way
@@ -743,7 +754,7 @@ async function runTurn(s: Session, tick: BackseatTick, ctrl: AbortController): P
     const t = stripThoughtTags(raw);
     if (!t || isSilenceFiller(t)) continue;
     if (isNoteLeak(t, rememberCalled)) {
-      slog(s, `turn ${tick.kind}: note leak dropped ("${t.slice(0, 60)}")`);
+      slog(s, `turn ${tick.kind}: note leak dropped`);
       continue;
     }
     parts.push(t);

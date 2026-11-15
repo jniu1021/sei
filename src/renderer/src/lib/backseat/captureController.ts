@@ -28,7 +28,6 @@ import {
   CAPTURE_W,
   JOLT_GAIN_DB,
   MIN_SPEAK_GAP_MS,
-  nextIdleDelayMs,
   START_LOOK_MS,
   SHARE_LABEL_INTERVAL_MS,
   STT_SAMPLE_RATE,
@@ -39,6 +38,7 @@ import { pushEnv, type EnvSample } from '../voice/echoGate';
 import { downmixInterleaved, resampleMono, rmsDb } from './pcm';
 import { createSttStream, type SttStream } from './sttStream';
 import { createSwitchDwell } from './switchDwell';
+import { classifyActivity, nextActivityIdleDelayMs, selectSamplingPolicy, type SamplingPolicy } from './activitySampling';
 
 /**
  * How long a grid captured at the player's first word stays usable. Someone can
@@ -459,6 +459,30 @@ export async function startCapture(
   // one window enumeration every five seconds instead of a recognition pass on
   // every other frame.
   let shareLabel: string | null = sourceName || null;
+  // A per-session opt-in makes the existing cadence a directly comparable baseline.
+  const activityAwareEnabled = localStorage.getItem('backseat.activityAwareSampling') === 'true';
+  let policy: SamplingPolicy = 'baseline';
+  let labelFresh = false;
+  let tickCount = 0;
+  let idleReady = false;
+  let lastActivityLog = '';
+  const updateActivity = (label: string | null): void => {
+    const decision = classifyActivity(labelFresh ? label : null, sourceId.startsWith('screen:') ? 'screen' : 'window');
+    const next = selectSamplingPolicy(activityAwareEnabled, decision);
+    const fallback = !activityAwareEnabled ? 'flag_disabled' : next === 'baseline' ? decision.reason : 'none';
+    const entry = `activity=${decision.activity} confidence=${decision.confidence} policy=${next} fallback=${fallback}`;
+    if (entry !== lastActivityLog) {
+      console.log(`[backseat/eval] ${entry}`);
+      lastActivityLog = entry;
+    }
+    if (next !== policy) {
+      console.log(`[backseat/eval] policy_switch from=${policy} to=${next}`);
+      policy = next;
+      worker.postMessage({ type: 'samplingPolicy', policy });
+      if (idleReady) scheduleIdle();
+    }
+  };
+  updateActivity(shareLabel);
   // The seed is the pick-time source name, which rarely matches the polled
   // title byte for byte, so the first poll result is a BASELINE, never a
   // switch signal — otherwise every session opened with a phantom switch.
@@ -467,18 +491,21 @@ export async function startCapture(
     void sei
       .backseatShareLabel(sourceId)
       .then((label) => {
+        // A failed/empty read is not evidence that the old title is still current.
+        labelFresh = Boolean(label);
         if (label && label !== shareLabel) {
           shareLabel = label;
-          console.log(`[backseat] sharing: ${label}`);
           // A changed title is changed content (a tab switch, a new video, a
           // different window frontmost): feed the switch dwell alongside the
           // colour arm. The dwell coalesces the two when both notice one event.
           if (labelBaselined) noteSwitchSignal();
         }
+        updateActivity(label);
         labelBaselined = true;
       })
       .catch(() => {
-        /* a missed poll keeps the last good label */
+        labelFresh = false;
+        updateActivity(null);
       });
   };
   pollShareLabel();
@@ -636,6 +663,8 @@ export async function startCapture(
     } = {},
   ): Promise<void> => {
     if (stopped) return;
+    tickCount++;
+    console.log(`[backseat/eval] tick_count=${tickCount} kind=${kind} policy=${policy}`);
     console.log(
       `[backseat] tick ${kind}: ${grid.ages.length} cell(s) at -${grid.ages
         .map((a) => a.toFixed(2))
@@ -679,6 +708,7 @@ export async function startCapture(
           colorDelta: number | null;
           colorThr: number | null;
           samples: number;
+          sampleCount: number;
         };
     if (msg.type === 'grid') {
       const resolve = pendingGrids.get(msg.requestId);
@@ -689,6 +719,9 @@ export async function startCapture(
       return;
     }
     if (msg.type === 'stats') {
+      // eps is the actual sampling/encode rate; the retained ring size is not
+      // a cumulative sample count.
+      console.log(`[backseat/eval] sample_count=${msg.sampleCount} sample_rate=${msg.eps ?? 'unknown'} policy=${policy}`);
       // Every 10 s, so "are the signals alive" is answerable from the devtools
       // console of the main window (260803: capture runs here now, so these are
       // reachable without the overlay's console relay). gain vs base is what the
@@ -749,7 +782,7 @@ export async function startCapture(
   const scheduleIdle = (): void => {
     if (stopped) return;
     window.clearTimeout(idleTimer);
-    const delay = nextIdleDelayMs();
+    const delay = nextActivityIdleDelayMs(policy);
     idleTimer = window.setTimeout(() => {
       scheduleIdle();
       if (paused || stopped || idleBusy) return;
@@ -776,8 +809,9 @@ export async function startCapture(
         }
       })();
     }, delay);
-    console.log(`[backseat] next idle look in ${(delay / 1000).toFixed(1)}s`);
+    console.log(`[backseat/eval] idle_delay_ms=${delay} policy=${policy}`);
   };
+  idleReady = true;
   scheduleIdle();
 
   // ── The opening look (260803) ───────────────────────────────────────────

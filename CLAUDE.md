@@ -1374,7 +1374,7 @@ The design and its measurements are committed at
   the in-app LogsBar). A `console.log` that skips `slog` is invisible in-app.
   Renderer-side capture diagnostics are now plain console lines in the main
   window, reachable in devtools.
-- **Dev grid dumps.** Unpackaged runs overwrite
+- **Dev grid dumps.** Only with `BACKSEAT_DEBUG_GRIDS=1`, unpackaged runs overwrite
   `<userData>/backseat-debug/grid-<kind>-latest.jpg` on every tick (the dir is
   logged at session start), so what the model is actually shown can be checked
   by eye.

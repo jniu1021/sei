@@ -66,6 +66,9 @@ Sei is an AI companion platform ([sei.gg](https://sei.gg)) that lets you chat, c
 
 ## Development
 
+The opt-in long-video Backseat sampling prototype and its local comparison plan
+are described in [docs/backseat-activity-mvp.md](docs/backseat-activity-mvp.md).
+
 ```bash
 git clone https://github.com/sei-studio/sei.git
 cd sei

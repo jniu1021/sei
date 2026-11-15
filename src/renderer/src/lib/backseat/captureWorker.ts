@@ -57,6 +57,7 @@ import {
   JOLT_GAIN_DB,
   JOLT_REFRACTORY_MS,
 } from '../../../../shared/backseatIpc';
+import { sampleIntervalMsForPolicy, type SamplingPolicy } from './activitySampling';
 import {
   baselineGain,
   blockMaxDelta,
@@ -128,6 +129,7 @@ const jolt = createJoltState();
 let running = false;
 /** Frames seen vs samples encoded, surfaced for diagnostics. */
 let framesSeen = 0;
+let sampleIntervalMs = SAMPLE_INTERVAL_MS;
 let encodes = 0;
 
 /**
@@ -253,7 +255,7 @@ async function onFrame(frame: VideoFrame): Promise<void> {
   // Uniform 10 Hz, independent of the capture rate. sample() returns
   // immediately; the encode finishes on a microtask so the frame loop is never
   // stalled by it.
-  if (now - lastSampleAt >= SAMPLE_INTERVAL_MS) {
+  if (now - lastSampleAt >= sampleIntervalMs) {
     lastSampleAt = now;
     sample(now, thumb);
   }
@@ -280,6 +282,7 @@ async function onFrame(frame: VideoFrame): Promise<void> {
       // Should sit at ~10/s. Below that means the encode is not keeping up and
       // the grid's recent cells are landing off their offsets.
       eps: lastStatsAt ? Math.round(((encodes - statsEncodes) * 1000) / span) : null,
+      sampleCount: encodes,
       gainDb: round1(currentGain),
       baseDb: round1(baselineGain(jolt)),
       colorDelta: round3n(colorDelta(jolt, now, thumb)),
@@ -449,6 +452,7 @@ self.onmessage = async (e: MessageEvent): Promise<void> => {
     | { type: 'start'; readable: ReadableStream<VideoFrame> }
     | { type: 'gain'; db: number }
     | { type: 'composite'; requestId: string }
+    | { type: 'samplingPolicy'; policy: SamplingPolicy }
     | { type: 'stop' };
 
   if (msg.type === 'start') {
@@ -458,6 +462,10 @@ self.onmessage = async (e: MessageEvent): Promise<void> => {
   }
   if (msg.type === 'gain') {
     currentGain = msg.db;
+    return;
+  }
+  if (msg.type === 'samplingPolicy') {
+    sampleIntervalMs = sampleIntervalMsForPolicy(msg.policy);
     return;
   }
   if (msg.type === 'composite') {
